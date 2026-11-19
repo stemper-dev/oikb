@@ -63,13 +63,16 @@ class WebConnector(BaseConnector):
 
         # Cache: url -> text content.
         self._cache: dict[str, str] = {}
+        self._files: dict[tuple[str, str], str] = {}
 
     def build_manifest(self) -> list[ManifestEntry]:
         """Discover pages via sitemap or crawling, then build manifest."""
         urls = self._discover_urls()
+        self._files.clear()
+        files_by_name: dict[tuple[str, str], list[tuple[bool, str]]] = {}
         entries: list[ManifestEntry] = []
 
-        for url in urls[:self.max_pages]:
+        for url in dict.fromkeys(urls[:self.max_pages]):
             try:
                 text = self._fetch_page(url)
                 if not text.strip():
@@ -88,27 +91,42 @@ class WebConnector(BaseConnector):
                 else:
                     dir_path, name = "", parts[0]
 
-                # Clean up the filename.
-                name = re.sub(r"[^\w\-.]", "_", name)
+                raw_name = name
+                name = re.sub(r"[^\w\-.]", "_", raw_name)
                 if not name.endswith(".txt"):
                     name += ".txt"
 
-                checksum = hashlib.sha256(text.encode()).hexdigest()[:16]
-
-                entries.append(
-                    ManifestEntry(
-                        filename=name,
-                        path=dir_path,
-                        checksum=checksum,
-                        size=len(text.encode()),
-                    )
-                )
+                lookup_changed = raw_name != name.removesuffix(".txt")
+                files_by_name.setdefault((dir_path, name), []).append((lookup_changed, url))
 
                 if self.delay > 0:
                     time.sleep(self.delay)
 
             except Exception:
                 continue
+
+        for (dir_path, name), pages in files_by_name.items():
+            # Give the original filename to a URL the old lookup could read.
+            for index, (_, url) in enumerate(sorted(pages)):
+                filename = name
+                if index:
+                    suffix = hashlib.sha256(url.encode()).hexdigest()[:12]
+                    stem = f"{name.removesuffix('.txt')}-{suffix}"
+                    filename = f"{stem}.txt"
+                    while (dir_path, filename) in files_by_name or (dir_path, filename) in self._files:
+                        stem += "_"
+                        filename = f"{stem}.txt"
+
+                self._files[(dir_path, filename)] = url
+                content = self._cache[url].encode()
+                entries.append(
+                    ManifestEntry(
+                        filename=filename,
+                        path=dir_path,
+                        checksum=hashlib.sha256(content).hexdigest()[:16],
+                        size=len(content),
+                    )
+                )
 
         entries.sort(key=lambda e: e.display_path)
         return entries
@@ -196,18 +214,11 @@ class WebConnector(BaseConnector):
 
     def read_file(self, path: str, filename: str) -> bytes:
         """Return cached page content."""
-        # Find matching URL from cache.
-        target = f"{path}/{filename}" if path else filename
-        target = target.removesuffix(".txt")
-
-        for url, text in self._cache.items():
-            url_path = urlparse(url).path.strip("/")
-            if not url_path:
-                url_path = "index"
-            if url_path == target or url_path.endswith(target):
-                return text.encode("utf-8")
-
-        raise FileNotFoundError(f"Page not in cache: {target}")
+        url = self._files.get((path, filename))
+        if url is None:
+            target = f"{path}/{filename}" if path else filename
+            raise FileNotFoundError(f"Page not in cache: {target}")
+        return self._cache[url].encode("utf-8")
 
     def close(self) -> None:
         self._http.close()
